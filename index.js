@@ -26,7 +26,7 @@ import {
 import { openai_setting_names, openai_settings } from '../../../openai.js';
 
 const extensionName = 'suspension';
-const VERSION = '0.4.0';
+const VERSION = '0.4.1';
 const MAX_ENTRIES = 200;        // 插件巡查最多保留条数
 const DEDUP_WINDOW_MS = 5000;   // 同来源 + 插件 + 消息在窗口内重复 → 只累加计数
 // 功能1 预设巡查
@@ -57,6 +57,7 @@ function freshSettings() {
     };
 }
 let settings = freshSettings();
+let pendingCorrection = '';   // 当前待注入给模型的矫正文本（单轮有效，供面板展示）
 
 function loadSettings() {
     const s = extension_settings[extensionName];
@@ -554,11 +555,15 @@ function formatPresetEntryText(e) {
 }
 // 下一轮静默注入给模型的矫正提示（单轮有效，生成结束即清除）
 function setCorrectionPrompt(text) {
+    pendingCorrection = text || '';
     try {
         setExtensionPrompt('suspension_preset', '[悬置之境·预设矫正] 上一轮回复违背了绑定的预设，请按以下要求修正，不要提及本条指令本身：\n' + text, extension_prompt_types.IN_CHAT, 1);
     } catch (e) { console.warn('[悬置之境] 注入矫正失败：', e); }
 }
 function clearCorrectionPrompt() {
+    pendingCorrection = '';
+    const box = $('#st-suspension .susp__pt-inject-text');
+    if (box.length) box.text('暂无。冲突且开启「自动注入矫正」后，这里会显示下一轮将要注入给模型的矫正内容（作为 IN_CHAT 提示注入，聊天里不可见）。');
     try {
         setExtensionPrompt('suspension_preset', '', extension_prompt_types.IN_CHAT, 1);
     } catch (e) { /* 忽略 */ }
@@ -723,6 +728,10 @@ function buildPanel() {
             <span><span class="susp__pt-dot green"></span>遵循 / 已读取</span>
             <span><span class="susp__pt-dot red"></span>冲突 / 没遵循</span>
             <span><span class="susp__pt-dot white"></span>本轮未使用</span>
+          </div>
+          <div class="susp__pt-inject">
+            <div class="susp__pt-inject-label">下一轮注入矫正</div>
+            <div class="susp__pt-inject-text"></div>
           </div>
           <div class="susp__pt-items"></div>
         </div>
@@ -971,6 +980,7 @@ function renderPreset() {
     const f = settings.features.preset;
     page.find('.susp__pt-enabled').prop('checked', !!f.enabled);
     page.find('.susp__pt-autoinject').prop('checked', !!f.autoInject);
+    page.find('.susp__pt-inject-text').text(pendingCorrection || '暂无。冲突且开启「自动注入矫正」后，这里会显示下一轮将要注入给模型的矫正内容（作为 IN_CHAT 提示注入，聊天里不可见）。');
 
     // 预设下拉（拉取酒馆已保存的聊天补全预设）
     const names = listPresets();
@@ -1001,8 +1011,8 @@ function renderPreset() {
                 <span class="susp__pt-dot ${status}"></span>
                 <div class="susp__pt-itemlight-body">
                   <div class="susp__pt-itemlight-name">${escapeHtml(it.name)} <span class="susp__pt-itemlight-status ${status}">${statusLabel[status] || '未使用'}</span></div>
-                  <div class="susp__pt-itemlight-content">${escapeHtml(it.content)}</div>
                   ${note ? `<div class="susp__pt-itemlight-note">${escapeHtml(note)}</div>` : ''}
+                  <details class="susp__pt-itemlight-details"><summary>查看内容</summary><div class="susp__pt-itemlight-content">${escapeHtml(it.content)}</div></details>
                 </div>
               </div>`);
         }
