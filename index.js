@@ -28,12 +28,13 @@ import {
 import { openai_setting_names, openai_settings } from '../../../openai.js';
 
 const extensionName = 'suspension';
-const VERSION = '0.8.0';
+const VERSION = '0.8.1';
 const MAX_ENTRIES = 200;        // 插件巡查最多保留条数
 const DEDUP_WINDOW_MS = 5000;   // 同来源 + 插件 + 消息在窗口内重复 → 只累加计数
 // 功能1 预设巡查
 const MAX_PRESET_ENTRIES = 100;   // 冲突记录最多保留条数
 const JUDGE_TIMEOUT_MS = 90000;   // 裁判调用超时
+const JUDGE_MAX_TOKENS = 2000;    // 裁判返回的最大 token 数：给足，避免逐条说明/矫正被默认回复长度截断
 const MODEL_FETCH_TIMEOUT_MS = 30000;  // 拉取模型列表超时
 
 // 捕获来源 → 面板展示名
@@ -362,6 +363,7 @@ async function callJudgeViaServer({ systemPrompt, prompt }) {
                 model: c.model.trim(),
                 messages,
                 stream: false,
+                max_tokens: JUDGE_MAX_TOKENS,
             }),
             signal: ctrl.signal,
         });
@@ -403,7 +405,7 @@ async function callJudgeDirect({ systemPrompt, prompt }) {
         res = await fetch(judgeEndpoint(c.url), {
             method: 'POST',
             headers,
-            body: JSON.stringify({ model: c.model.trim(), messages, stream: false }),
+            body: JSON.stringify({ model: c.model.trim(), messages, stream: false, max_tokens: JUDGE_MAX_TOKENS }),
             signal: ctrl.signal,
         });
     } catch (e) {
