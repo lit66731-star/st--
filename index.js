@@ -26,14 +26,13 @@ import {
 import { openai_setting_names, openai_settings } from '../../../openai.js';
 
 const extensionName = 'suspension';
-const VERSION = '0.3.0';
+const VERSION = '0.4.0';
 const MAX_ENTRIES = 200;        // 插件巡查最多保留条数
 const DEDUP_WINDOW_MS = 5000;   // 同来源 + 插件 + 消息在窗口内重复 → 只累加计数
 // 功能1 预设巡查
 const MAX_PRESET_ENTRIES = 100;   // 冲突记录最多保留条数
-const PRESET_ITEM_CHARS = 600;    // 每个预设条目喂给裁判的内容上限（字符）
-const PRESET_MAX_ITEMS = 12;      // 最多把多少个预设条目喂给裁判
 const JUDGE_TIMEOUT_MS = 90000;   // 裁判调用超时
+const MODEL_FETCH_TIMEOUT_MS = 30000;  // 拉取模型列表超时
 
 // 捕获来源 → 面板展示名
 const SRC_LABELS = {
@@ -286,7 +285,6 @@ function presetItems(preset) {
         if (!content) continue;
         const label = (p.name && p.name !== p.identifier) ? p.name : (p.identifier || '');
         items.push({ name: label || ('条目' + (items.length + 1)), content });
-        if (items.length >= PRESET_MAX_ITEMS) break;
     }
     return items;
 }
@@ -404,6 +402,67 @@ async function callJudge({ systemPrompt, prompt }) {
     return callJudgeDirect({ systemPrompt, prompt });
 }
 
+// ---------------- 裁判模型拉取 + 弹窗选择 ----------------
+async function fetchJudgeModels() {
+    const c = settings.judge;
+    if (!c.url) throw new Error('请先填接口地址');
+    const endpoint = judgeBaseUrl(c.url) + '/models';
+    const headers = {};
+    if (c.key) headers.Authorization = 'Bearer ' + c.key.trim();
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), MODEL_FETCH_TIMEOUT_MS);
+    let res;
+    try {
+        res = await fetch(endpoint, { headers, signal: ctrl.signal });
+    } catch (e) {
+        clearTimeout(timer);
+        const m = safeErrorText(e, c.key) || '拉取失败';
+        throw new Error(/failed to fetch|networkerror|load failed/i.test(m) ? '浏览器直连被拦截（对方服务可能不允许跨域 CORS），无法拉取模型列表，请手动填写模型名' : m);
+    }
+    clearTimeout(timer);
+    if (!res.ok) {
+        const t = await res.text().catch(() => '');
+        throw new Error('HTTP ' + res.status + ' ' + safeErrorText(t, c.key));
+    }
+    const d = await res.json();
+    let list = [];
+    if (d && Array.isArray(d.data)) list = d.data.map(m => (typeof m === 'string' ? m : (m.id || m.name || m.model))).filter(Boolean);
+    else if (d && Array.isArray(d.models)) list = d.models.map(m => (typeof m === 'string' ? m : (m.name || m.model || m.id))).filter(Boolean);
+    else if (Array.isArray(d)) list = d.map(m => (typeof m === 'string' ? m : (m.id || m.name || m.model))).filter(Boolean);
+    return list;
+}
+function showModelPicker(models) {
+    $('.susp__modal-mask').remove();
+    const mask = $(`
+      <div class="susp__modal-mask">
+        <div class="susp__modal">
+          <div class="susp__modal-head">
+            <span class="susp__modal-title">选择模型（${models.length}）</span>
+            <button type="button" class="susp__modal-close" title="关闭">×</button>
+          </div>
+          <input type="text" class="susp__modal-search" placeholder="搜索模型…" spellcheck="false">
+          <div class="susp__modal-list"></div>
+        </div>
+      </div>`);
+    const list = mask.find('.susp__modal-list');
+    const render = (q) => {
+        list.empty();
+        for (const m of models) {
+            if (q && String(m).toLowerCase().indexOf(q) < 0) continue;
+            const item = $(`<div class="susp__modal-item${m === settings.judge.model ? ' on' : ''}">${escapeHtml(m)}</div>`);
+            item.on('click', () => { settings.judge.model = m; saveSettings(); renderOverview(); mask.remove(); });
+            list.append(item);
+        }
+        if (!list.children().length) list.append('<div class="susp__modal-empty">无匹配模型</div>');
+    };
+    render('');
+    mask.on('click', '.susp__modal-close', () => mask.remove());
+    mask.on('click', (e) => { if (e.target === mask[0]) mask.remove(); });
+    mask.find('.susp__modal-search').on('input', function () { render(String($(this).val() || '').trim().toLowerCase()); });
+    $('body').append(mask);
+    mask.find('.susp__modal-search').trigger('focus');
+}
+
 // ---------------- 判定逻辑 ----------------
 function lastAIMessage() {
     const msgs = Array.isArray(chat) ? chat : [];
@@ -417,7 +476,7 @@ function lastAIMessage() {
 const JUDGE_SYSTEM = '你是一个严格的「酒馆预设合规裁判」。你会拿到：预设里的多个条目（每个条目有编号、名称、内容），以及一段模型刚生成的回复。\n\n对每个条目，判断模型回复对该条目要求的落实情况，三选一：\n- 遵循：回复明显落实 / 遵守了该条目的要求（绿灯）\n- 冲突：回复明确违背了该条目的要求（红灯）\n- 未使用：该条目与这轮回复无关，既谈不上遵循也谈不上违背（白灯）\n\n只判「明确可验证」的要求，不吹毛求疵。严格按以下格式输出，每个条目一行，不要输出任何多余文字：\n【条目1】遵循/冲突/未使用 ｜ 简短说明（冲突时说明违背了哪条，遵循或未使用时填「无」）\n【条目2】… 依次类推，直到【条目N】';
 
 function buildJudgePrompt(items, replyText) {
-    const list = items.map((it, i) => '条目' + (i + 1) + '（' + it.name + '）：' + it.content.slice(0, PRESET_ITEM_CHARS)).join('\n\n');
+    const list = items.map((it, i) => '条目' + (i + 1) + '（' + it.name + '）：' + it.content).join('\n\n');
     return '【预设条目】\n' + (list || '（预设里没有可用条目）') + '\n\n【模型回复】\n' + (replyText || '（回复为空）') + '\n\n请逐条判定。';
 }
 function parseItemJudgeOutput(raw, count) {
@@ -604,7 +663,10 @@ function buildPanel() {
           </div>
           <div class="susp__field">
             <label>模型</label>
-            <input type="text" class="susp__judge-model" placeholder="例如 gpt-4o-mini / qwen2.5:7b" spellcheck="false">
+            <div class="susp__judge-model-row">
+              <input type="text" class="susp__judge-model" placeholder="例如 gpt-4o-mini / qwen2.5:7b" spellcheck="false">
+              <button type="button" class="susp__btn susp__judge-models">拉取模型</button>
+            </div>
           </div>
         </details>
       </div>
@@ -719,6 +781,22 @@ function buildPanel() {
     panel.on('change', '.susp__judge-url', function () { settings.judge.url = String($(this).val() || '').trim(); saveSettings(); });
     panel.on('change', '.susp__judge-key', function () { settings.judge.key = String($(this).val() || '').trim(); saveSettings(); });
     panel.on('change', '.susp__judge-model', function () { settings.judge.model = String($(this).val() || '').trim(); saveSettings(); });
+    panel.on('click', '.susp__judge-models', function () {
+        const btn = $(this);
+        if (btn.prop('disabled')) return;
+        btn.prop('disabled', true).text('拉取中…');
+        fetchJudgeModels()
+            .then(models => {
+                if (!models.length) throw new Error('接口没有返回模型列表');
+                showModelPicker(models);
+            })
+            .catch(e => {
+                const m = safeErrorText(e, settings.judge.key);
+                if (typeof toastr !== 'undefined') toastr.warning(m || '拉取模型失败');
+                else console.warn('[悬置之境] 拉取模型失败：', m);
+            })
+            .finally(() => { btn.prop('disabled', false).text('拉取模型'); });
+    });
 
     // 插件巡查：来源过滤 / 插件过滤 / 搜索 / 清空 / 复制全部 / 单条复制
     panel.on('click', '.susp__pw-src', function () {
@@ -923,7 +1001,7 @@ function renderPreset() {
                 <span class="susp__pt-dot ${status}"></span>
                 <div class="susp__pt-itemlight-body">
                   <div class="susp__pt-itemlight-name">${escapeHtml(it.name)} <span class="susp__pt-itemlight-status ${status}">${statusLabel[status] || '未使用'}</span></div>
-                  <div class="susp__pt-itemlight-content">${escapeHtml(it.content.slice(0, 400))}${it.content.length > 400 ? '…' : ''}</div>
+                  <div class="susp__pt-itemlight-content">${escapeHtml(it.content)}</div>
                   ${note ? `<div class="susp__pt-itemlight-note">${escapeHtml(note)}</div>` : ''}
                 </div>
               </div>`);

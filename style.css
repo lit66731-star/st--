@@ -156,6 +156,81 @@
 }
 #st-suspension .susp__field input:focus { border-color: var(--susp-accent); }
 
+/* 模型拉取按钮行 */
+#st-suspension .susp__judge-model-row { display: flex; align-items: center; gap: 8px; }
+#st-suspension .susp__judge-model-row input { flex: 1 1 auto; width: auto; }
+#st-suspension .susp__judge-model-row .susp__btn { flex: 0 0 auto; }
+
+/* 模型选择弹窗（挂在 body 上，独立于面板作用域） */
+.susp__modal-mask,
+.susp__modal-mask * { box-sizing: border-box; text-shadow: none !important; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
+.susp__modal-mask {
+    position: fixed;
+    inset: 0;
+    z-index: 30000;
+    background: rgba(0, 0, 0, 0.55);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+}
+.susp__modal {
+    width: 100%;
+    max-width: 480px;
+    max-height: 70vh;
+    display: flex;
+    flex-direction: column;
+    background: #14181f;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 16px;
+    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+    overflow: hidden;
+}
+.susp__modal-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 16px 18px 10px;
+}
+.susp__modal-title { font-size: 15px; font-weight: 600; color: #e6e9ef; }
+.susp__modal-close {
+    background: none;
+    border: none;
+    color: #8b93a1;
+    font-size: 22px;
+    line-height: 1;
+    cursor: pointer;
+    padding: 2px 6px;
+}
+.susp__modal-close:hover { color: #e6e9ef; }
+.susp__modal-search {
+    margin: 0 18px 10px;
+    padding: 8px 12px;
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.09);
+    border-radius: 9px;
+    color: #e6e9ef;
+    font-size: 13px;
+    outline: none;
+}
+.susp__modal-search:focus { border-color: #4fd6c0; }
+.susp__modal-list {
+    flex: 1 1 auto;
+    overflow-y: auto;
+    padding: 4px 10px 14px;
+}
+.susp__modal-item {
+    padding: 9px 12px;
+    border-radius: 9px;
+    font-size: 13px;
+    color: #e6e9ef;
+    cursor: pointer;
+    word-break: break-all;
+}
+.susp__modal-item:hover { background: rgba(79, 214, 192, 0.12); }
+.susp__modal-item.on { background: rgba(79, 214, 192, 0.16); color: #4fd6c0; }
+.susp__modal-empty { text-align: center; color: #8b93a1; font-size: 13px; padding: 20px 0; }
+
 /* 插件巡查：工具栏 */
 #st-suspension .susp__pw-toolbar {
     display: flex;
