@@ -26,7 +26,7 @@ import {
 import { openai_setting_names, openai_settings } from '../../../openai.js';
 
 const extensionName = 'suspension';
-const VERSION = '0.4.1';
+const VERSION = '0.5.0';
 const MAX_ENTRIES = 200;        // 插件巡查最多保留条数
 const DEDUP_WINDOW_MS = 5000;   // 同来源 + 插件 + 消息在窗口内重复 → 只累加计数
 // 功能1 预设巡查
@@ -50,7 +50,7 @@ function freshSettings() {
         judge: { url: '', key: '', model: '' },     // 独立裁判 endpoint（功能 1/2/4 共用）
         features: {
             preset: { enabled: false, presetName: '', autoInject: true, entries: [], items: [] },  // 功能1 预设启用巡查
-            style: { enabled: false },              // 功能2 文风注入自检（待实现）
+            style: { enabled: false, presetName: '', autoInject: true, marked: [], entries: [] },  // 功能2 文风注入自检
             pluginWatch: { enabled: true, entries: [] },  // 功能3 插件巡查（已实现）
             persona: { enabled: false },            // 功能4 人设巡查（待实现）
         },
@@ -79,6 +79,12 @@ function loadSettings() {
             if (typeof s.features[k].autoInject !== 'boolean') s.features[k].autoInject = true;
             if (!Array.isArray(s.features[k].entries)) s.features[k].entries = [];
             if (!Array.isArray(s.features[k].items)) s.features[k].items = [];
+        }
+        if (k === 'style') {
+            if (typeof s.features[k].presetName !== 'string') s.features[k].presetName = '';
+            if (typeof s.features[k].autoInject !== 'boolean') s.features[k].autoInject = true;
+            if (!Array.isArray(s.features[k].marked)) s.features[k].marked = [];
+            if (!Array.isArray(s.features[k].entries)) s.features[k].entries = [];
         }
     }
     settings = s;
@@ -635,12 +641,12 @@ function buildPanel() {
           <div class="susp__card" data-feature="style">
             <div class="susp__card-top">
               <span class="susp__card-title">文风自检</span>
-              <span class="susp__card-badge">规划中</span>
+              <span class="susp__card-badge wip">进行中</span>
             </div>
             <div class="susp__card-desc">标记预设中的文风段落，每轮自检正文是否脱风，脱离下轮自动注入矫正。</div>
             <div class="susp__card-foot">
               <label class="susp__switch"><input type="checkbox" class="susp__card-toggle" data-feature="style"><span class="susp__switch-slider"></span></label>
-              <span class="susp__card-foot-label">启用（待实现）</span>
+              <span class="susp__card-foot-label">启用</span>
             </div>
           </div>
           <div class="susp__card" data-feature="persona">
@@ -739,11 +745,22 @@ function buildPanel() {
       </div>
 
       <div class="susp__body" data-page="style" style="display:none">
-        <div class="susp__placeholder">
-          <div class="susp__placeholder-badge">规划中</div>
-          <div class="susp__placeholder-title">文风注入自检</div>
-          <div class="susp__placeholder-desc">在选中的预设里单独标注出文风（可多个），每轮对正文做自检，检查是否脱离文风；如脱离，下一轮自动注入给模型矫正。将在后续版本上线。</div>
+        <div class="susp__pt-toolbar">
+          <label class="susp__switch"><input type="checkbox" class="susp__st-enabled"><span class="susp__switch-slider"></span></label>
+          <span class="susp__pw-enable-label">启用自检</span>
+          <span class="susp__spacer"></span>
+          <button type="button" class="susp__btn susp__st-refresh">刷新预设列表</button>
         </div>
+        <div class="susp__pt-bind">
+          <div class="susp__field">
+            <label>绑定预设（从中勾选文风段落）</label>
+            <select class="susp__st-preset"><option value="">— 未绑定 —</option></select>
+          </div>
+          <label class="susp__pt-auto"><input type="checkbox" class="susp__st-autoinject"> 脱风时下一轮自动注入矫正</label>
+          <div class="susp__st-hint">勾选下面的条目，把它标记为「文风段落」（可多个）。每轮生成后，独立裁判会检查正文是否脱离这些文风，脱离则下一轮自动注入矫正。已标记 <b class="susp__st-count">0</b> 段。</div>
+          <div class="susp__st-items"></div>
+        </div>
+        <div class="susp__st-list"></div>
       </div>
 
       <div class="susp__body" data-page="persona" style="display:none">
@@ -864,6 +881,38 @@ function buildPanel() {
         saveSettings();
         renderPreset();
     });
+    // 文风自检：开关 / 绑定 / 自动注入 / 刷新 / 标记文风段落
+    panel.on('change', '.susp__st-enabled', function () {
+        settings.features.style.enabled = $(this).prop('checked');
+        saveSettings();
+        renderStyle();
+        renderOverview();
+    });
+    panel.on('change', '.susp__st-preset', function () {
+        settings.features.style.presetName = $(this).val() || '';
+        settings.features.style.marked = [];
+        saveSettings();
+        renderStyle();
+    });
+    panel.on('change', '.susp__st-autoinject', function () {
+        settings.features.style.autoInject = $(this).prop('checked');
+        saveSettings();
+    });
+    panel.on('click', '.susp__st-refresh', function () { renderStyle(); });
+    panel.on('change', '.susp__st-mark', function () {
+        const name = $(this).data('name');
+        const on = $(this).prop('checked');
+        const f = settings.features.style;
+        const i = f.marked.findIndex(m => m.name === name);
+        if (on && i < 0) {
+            const preset = getPresetByName(f.presetName);
+            const it = preset ? presetItems(preset).find(x => x.name === name) : null;
+            f.marked.push({ name, content: it ? it.content : '' });
+        }
+        if (!on && i >= 0) f.marked.splice(i, 1);
+        saveSettings();
+        renderStyle();
+    });
 }
 
 function togglePanel(show) {
@@ -880,6 +929,7 @@ function renderPanel() {
     renderOverview();
     renderPluginWatch();
     renderPreset();
+    renderStyle();
     renderExtensionRoster();
 }
 
@@ -1042,6 +1092,48 @@ function renderPreset() {
     }
     if (entries.length) {
         ul.append('<div class="susp__pt-clear-row"><button type="button" class="susp__btn susp__pt-clear">清空记录</button></div>');
+    }
+}
+
+function renderStyle() {
+    const page = $('#st-suspension [data-page="style"]');
+    if (!page.length) return;
+    const f = settings.features.style;
+    page.find('.susp__st-enabled').prop('checked', !!f.enabled);
+    page.find('.susp__st-autoinject').prop('checked', !!f.autoInject);
+
+    // 预设下拉（拉取酒馆已保存的聊天补全预设）
+    const names = listPresets();
+    const sel = page.find('.susp__st-preset');
+    const cur = names.includes(f.presetName) ? f.presetName : (f.presetName || '');
+    sel.html('<option value="">— 未绑定 —</option>' + names.map(n => `<option value="${escapeHtml(n)}"${n === cur ? ' selected' : ''}>${escapeHtml(n)}</option>`).join(''));
+    if (f.presetName && !names.includes(f.presetName)) {
+        sel.append(`<option value="${escapeHtml(f.presetName)}" selected>${escapeHtml(f.presetName)}（已失效）</option>`);
+    }
+
+    // 条目勾选：勾中即标记为「文风段落」
+    const itemsBox = page.find('.susp__st-items').empty();
+    const preset = cur ? getPresetByName(cur) : null;
+    const items = preset ? presetItems(preset) : [];
+    const markedNames = new Set((f.marked || []).map(m => m.name));
+    page.find('.susp__st-count').text((f.marked || []).length);
+    if (!cur) {
+        itemsBox.append('<div class="susp__pt-warn">' + (judgeApiConfigured() ? '请先绑定一个预设，绑定后这里会列出预设里的每个条目，勾选即为「文风段落」。' : '请先在「总览 → 裁判引擎设置」里填好接口地址与模型，文风自检才可用。') + '</div>');
+    } else if (!items.length) {
+        itemsBox.append('<div class="susp__pt-warn">该预设里没有可用的指令条目（可能全部是 marker 或空内容），无法标记文风。</div>');
+    } else {
+        for (const it of items) {
+            const on = markedNames.has(it.name);
+            itemsBox.append(`
+              <div class="susp__st-item${on ? ' on' : ''}">
+                <label class="susp__st-item-row">
+                  <input type="checkbox" class="susp__st-mark" data-name="${escapeHtml(it.name)}"${on ? ' checked' : ''}>
+                  <span class="susp__st-item-name">${escapeHtml(it.name)}</span>
+                  <span class="susp__st-item-tag">文风</span>
+                </label>
+                <details class="susp__pt-itemlight-details"><summary>查看内容</summary><div class="susp__pt-itemlight-content">${escapeHtml(it.content)}</div></details>
+              </div>`);
+        }
     }
 }
 
