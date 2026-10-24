@@ -4,23 +4,35 @@
 //   功能3 · 插件巡查（本版已实现）：静默捕获运行中插件的报错 / 失败
 //           （console.error / console.warn / 未捕获异常 / 未处理 Promise 拒绝），
 //           归档到面板，可搜索 / 过滤 / 复制；不弹窗、不打断。
-//   功能1 · 预设启用巡查（规划中）：绑定预设，每轮检查预设是否被模型读取并实施，
+//   功能1 · 预设启用巡查（已实现）：绑定预设，每轮检查预设是否被模型读取并实施，
 //           冲突标注，下一轮自动注入给模型矫正。
 //   功能2 · 文风注入自检（规划中）：标记预设中的文风段落，每轮自检正文是否脱风，
 //           脱离则下一轮自动注入矫正。
 //   功能4 · 人设巡查（规划中）：绑定当前人物卡，每轮检查是否 OOC / 超雄等，
 //           冲突归档到面板，下一轮静默注入矫正。
 //
-// 功能 1/2/4 的「巡查判定」统一走独立可配裁判 endpoint（settings.judge），
-// 本版先落地配置 UI，判定逻辑后续接入。
+// 功能 1/2/4 的「巡查判定」统一走独立可配裁判 endpoint（settings.judge）。
 
 import { extension_settings } from '../../../extensions.js';
-import { saveSettingsDebounced } from '../../../../script.js';
+import {
+    chat,
+    getRequestHeaders,
+    eventSource,
+    event_types,
+    setExtensionPrompt,
+    extension_prompt_types,
+    saveSettingsDebounced,
+} from '../../../../script.js';
+import { openai_setting_names, openai_settings } from '../../../openai.js';
 
 const extensionName = 'suspension';
-const VERSION = '0.1.0';
+const VERSION = '0.2.0';
 const MAX_ENTRIES = 200;        // 插件巡查最多保留条数
 const DEDUP_WINDOW_MS = 5000;   // 同来源 + 插件 + 消息在窗口内重复 → 只累加计数
+// 功能1 预设巡查
+const MAX_PRESET_ENTRIES = 100;          // 冲突记录最多保留条数
+const PRESET_INSTRUCTION_CHARS = 3000;   // 喂给裁判的预设指令上限（字符）
+const JUDGE_TIMEOUT_MS = 90000;          // 裁判调用超时
 
 // 捕获来源 → 面板展示名
 const SRC_LABELS = {
@@ -37,7 +49,7 @@ function freshSettings() {
         enabled: true,                              // 总开关
         judge: { url: '', key: '', model: '' },     // 独立裁判 endpoint（功能 1/2/4 共用）
         features: {
-            preset: { enabled: false },             // 功能1 预设启用巡查（待实现）
+            preset: { enabled: false, presetName: '', autoInject: true, entries: [] },  // 功能1 预设启用巡查
             style: { enabled: false },              // 功能2 文风注入自检（待实现）
             pluginWatch: { enabled: true, entries: [] },  // 功能3 插件巡查（已实现）
             persona: { enabled: false },            // 功能4 人设巡查（待实现）
@@ -61,6 +73,11 @@ function loadSettings() {
         if (!s.features[k] || typeof s.features[k] !== 'object' || Array.isArray(s.features[k])) s.features[k] = {};
         if (typeof s.features[k].enabled !== 'boolean') s.features[k].enabled = def.features[k].enabled;
         if (k === 'pluginWatch' && !Array.isArray(s.features[k].entries)) s.features[k].entries = [];
+        if (k === 'preset') {
+            if (typeof s.features[k].presetName !== 'string') s.features[k].presetName = '';
+            if (typeof s.features[k].autoInject !== 'boolean') s.features[k].autoInject = true;
+            if (!Array.isArray(s.features[k].entries)) s.features[k].entries = [];
+        }
     }
     settings = s;
 }
@@ -209,6 +226,239 @@ function formatEntryText(e) {
     return lines.join('\n');
 }
 
+// ---------------- 功能1 · 预设启用巡查 ----------------
+let presetInspecting = false;
+
+// 酒馆已保存的聊天补全预设名列表（openai_setting_names 的键即预设名）
+function listPresets() {
+    if (!openai_setting_names || typeof openai_setting_names !== 'object' || Array.isArray(openai_setting_names)) return [];
+    return Object.keys(openai_setting_names).filter(n => n && n !== 'undefined' && n !== 'null');
+}
+// 按名取预设对象（openai_settings 数组按 index 对齐 openai_setting_names）
+function getPresetByName(name) {
+    if (!name || !openai_setting_names || !openai_settings || !Array.isArray(openai_settings)) return null;
+    const idx = openai_setting_names[name];
+    if (idx == null) return null;
+    return openai_settings[idx] || null;
+}
+// 预设的「指令文本」：把非 marker 的 prompt 内容拼起来喂给裁判
+function presetInstructionText(preset) {
+    if (!preset || !Array.isArray(preset.prompts)) return '';
+    const parts = [];
+    for (const p of preset.prompts) {
+        if (!p || p.marker) continue;
+        const content = String(p.content || '').trim();
+        if (!content) continue;
+        const label = (p.name && p.name !== p.identifier) ? (p.name + '：') : '';
+        parts.push(label + content);
+    }
+    return parts.join('\n\n').slice(0, PRESET_INSTRUCTION_CHARS);
+}
+
+// ---------------- 裁判引擎（独立 endpoint，转发写法沿用 st-amor） ----------------
+function judgeApiConfigured() {
+    const c = settings.judge || {};
+    return !!(c.url && c.model);
+}
+function judgeEndpoint(url) {
+    url = String(url || '').trim().replace(/\/+$/, '');
+    if (/\/chat\/completions$/i.test(url)) return url;
+    return url + '/chat/completions';
+}
+function judgeBaseUrl(url) {
+    return String(url || '').trim().replace(/\/+$/, '').replace(/\/chat\/completions$/i, '');
+}
+function safeErrorText(e, key, max = 160) {
+    let t = String((e && e.message) ? e.message : e);
+    const k = String(key || '').trim();
+    if (k.length >= 6) t = t.split(k).join('***');
+    t = t.replace(/Bearer\s+[A-Za-z0-9._~+\/=-]{6,}/gi, 'Bearer ***')
+        .replace(/\b(sk|rk|pk|ak|key)-[A-Za-z0-9_*-]{6,}/gi, '$1-***')
+        .replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+    return t.length > max ? t.slice(0, max) + '…' : t;
+}
+// 经酒馆服务器转发（不受浏览器跨域限制）
+async function callJudgeViaServer({ systemPrompt, prompt }) {
+    const c = settings.judge;
+    const messages = [];
+    if (systemPrompt) messages.push({ role: 'system', content: systemPrompt });
+    messages.push({ role: 'user', content: prompt });
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), JUDGE_TIMEOUT_MS);
+    let res;
+    try {
+        res = await fetch('/api/backends/chat-completions/generate', {
+            method: 'POST',
+            headers: getRequestHeaders(),
+            body: JSON.stringify({
+                chat_completion_source: 'custom',
+                custom_url: judgeBaseUrl(c.url),
+                custom_include_headers: 'Authorization: ' + JSON.stringify(c.key ? 'Bearer ' + c.key.trim() : '') + '\n',
+                model: c.model.trim(),
+                messages,
+                stream: false,
+            }),
+            signal: ctrl.signal,
+        });
+    } catch (e) {
+        if (e && e.name === 'AbortError') throw new Error('请求超时（' + Math.round(JUDGE_TIMEOUT_MS / 1000) + ' 秒）');
+        const err = new Error(safeErrorText(e, c.key) || '网络请求失败');
+        err.unreachable = true;
+        throw err;
+    } finally {
+        clearTimeout(timer);
+    }
+    if (res.status === 404 || res.status === 405 || res.status === 403 || res.status === 401) {
+        const err = new Error('酒馆转发接口不可用（HTTP ' + res.status + '）');
+        err.unreachable = true;
+        throw err;
+    }
+    const text = await res.text().catch(() => '');
+    let d = null;
+    try { d = JSON.parse(text); } catch (e) { /* 非 JSON */ }
+    if (!res.ok || (d && d.error)) {
+        const msg = d && d.error && (d.error.message || (typeof d.error === 'string' ? d.error : ''));
+        throw new Error('HTTP ' + res.status + ' ' + safeErrorText(msg || text, c.key));
+    }
+    const out = d && d.choices && d.choices[0] && d.choices[0].message && d.choices[0].message.content;
+    if (!out) throw new Error('返回内容为空');
+    return out;
+}
+async function callJudgeDirect({ systemPrompt, prompt }) {
+    const c = settings.judge;
+    const headers = { 'Content-Type': 'application/json' };
+    if (c.key) headers.Authorization = 'Bearer ' + c.key.trim();
+    const messages = [];
+    if (systemPrompt) messages.push({ role: 'system', content: systemPrompt });
+    messages.push({ role: 'user', content: prompt });
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), JUDGE_TIMEOUT_MS);
+    let res;
+    try {
+        res = await fetch(judgeEndpoint(c.url), {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({ model: c.model.trim(), messages, stream: false }),
+            signal: ctrl.signal,
+        });
+    } catch (e) {
+        if (e && e.name === 'AbortError') throw new Error('请求超时（' + Math.round(JUDGE_TIMEOUT_MS / 1000) + ' 秒）');
+        const m = safeErrorText(e, c.key) || '网络请求失败';
+        throw new Error(/failed to fetch|networkerror|load failed/i.test(m) ? '浏览器直连被拦截（多半是对方服务不允许跨域），请检查地址是否可达' : m);
+    } finally {
+        clearTimeout(timer);
+    }
+    if (!res.ok) {
+        const t = await res.text().catch(() => '');
+        const detail = safeErrorText(t, c.key);
+        throw new Error('HTTP ' + res.status + (detail ? ' ' + detail : ''));
+    }
+    const d = await res.json();
+    const out = d && d.choices && d.choices[0] && d.choices[0].message && d.choices[0].message.content;
+    if (!out) throw new Error('返回内容为空');
+    return out;
+}
+async function callJudge({ systemPrompt, prompt }) {
+    try {
+        return await callJudgeViaServer({ systemPrompt, prompt });
+    } catch (e) {
+        if (!e || !e.unreachable) throw e;
+        console.warn('[悬置之境] 酒馆转发不可用，改用浏览器直连：', e.message);
+    }
+    return callJudgeDirect({ systemPrompt, prompt });
+}
+
+// ---------------- 判定逻辑 ----------------
+function lastAIMessage() {
+    const msgs = Array.isArray(chat) ? chat : [];
+    for (let i = msgs.length - 1; i >= 0; i--) {
+        if (msgs[i] && msgs[i].is_user === false && typeof msgs[i].mes === 'string' && msgs[i].mes.trim()) {
+            return msgs[i].mes.trim();
+        }
+    }
+    return '';
+}
+function cleanText(s) {
+    return String(s || '').replace(/\r/g, '').trim();
+}
+
+const JUDGE_SYSTEM = '你是一个严格的「酒馆预设合规裁判」。你会拿到：(1) 一段预设指令，(2) 一段模型刚生成的回复。你的唯一任务：判断这段回复是否违背了预设里明确、可验证的要求（例如人设、格式、输出规则、禁止事项、文风硬性约束等）。只抓「明确违背」，不抓主观喜好、不吹毛求疵、不要求回复里逐条复述预设。\n\n严格按以下格式输出，不要输出任何多余文字：\n【合规】是 或 否\n【问题】若合规填「无」，否则用一句话说清违背了哪条\n【矫正】若合规填「无」，否则用一句话写清下一轮该怎么改';
+
+function buildJudgePrompt(presetText, replyText) {
+    return '【预设指令】\n' + (presetText || '（预设里没有可用指令文本）') + '\n\n【模型回复】\n' + (replyText || '（回复为空）') + '\n\n请判定。';
+}
+function parseJudgeOutput(raw) {
+    const pick = (label) => {
+        const re = new RegExp('【' + label + '】\\s*([\\s\\S]*?)(?=【[^】]*】|$)', 'i');
+        const m = String(raw || '').match(re);
+        return m ? m[1].trim() : '';
+    };
+    const ok = pick('合规');
+    const compliant = /否/.test(ok) ? false : (/是/.test(ok) ? true : null);
+    return { compliant, problem: pick('问题'), correction: pick('矫正') };
+}
+
+async function inspectPreset(force) {
+    const f = settings.features.preset;
+    if (presetInspecting) return;
+    if (!settings.enabled || !f.presetName) return;
+    if (!f.enabled && !force) return;
+    if (!judgeApiConfigured()) return;
+    const reply = lastAIMessage();
+    if (!reply) return;
+    const preset = getPresetByName(f.presetName);
+    const instruction = presetInstructionText(preset);
+    presetInspecting = true;
+    try {
+        const raw = await callJudge({ systemPrompt: JUDGE_SYSTEM, prompt: buildJudgePrompt(instruction, reply) });
+        const r = parseJudgeOutput(raw);
+        if (r.compliant === false) {
+            pushPresetEntry({ problem: r.problem || '（裁判未给出具体问题）', correction: r.correction, replySnippet: reply.slice(0, 400) });
+        }
+    } catch (e) {
+        pushPresetEntry({ problem: '裁判调用失败：' + safeErrorText(e, settings.judge.key), correction: '' });
+    } finally {
+        presetInspecting = false;
+        if ($('#st-suspension').is(':visible')) renderPreset();
+    }
+}
+function pushPresetEntry(o) {
+    const f = settings.features.preset;
+    f.entries.unshift({
+        id: uid(),
+        ts: Date.now(),
+        problem: String(o.problem || '').slice(0, 1000),
+        correction: String(o.correction || '').slice(0, 1000),
+        reply: String(o.replySnippet || ''),
+    });
+    if (f.entries.length > MAX_PRESET_ENTRIES) f.entries.length = MAX_PRESET_ENTRIES;
+    saveSettings();
+    // 冲突 + 开了自动注入 → 下一轮静默注入矫正
+    if (f.enabled && f.autoInject && o.correction) setCorrectionPrompt(o.correction);
+}
+function formatPresetEntryText(e) {
+    const lines = [
+        '[悬置之境 · 预设巡查]',
+        '时间: ' + fmtTime(e.ts),
+        '预设: ' + (settings.features.preset.presetName || '未绑定'),
+        '问题: ' + (e.problem || ''),
+    ];
+    if (e.correction) lines.push('矫正: ' + e.correction);
+    if (e.reply) lines.push('回复片段: ' + e.reply);
+    return lines.join('\n');
+}
+// 下一轮静默注入给模型的矫正提示（单轮有效，生成结束即清除）
+function setCorrectionPrompt(text) {
+    try {
+        setExtensionPrompt('suspension_preset', '[悬置之境·预设矫正] 上一轮回复违背了绑定的预设，请按以下要求修正，不要提及本条指令本身：\n' + text, extension_prompt_types.IN_CHAT, 1);
+    } catch (e) { console.warn('[悬置之境] 注入矫正失败：', e); }
+}
+function clearCorrectionPrompt() {
+    try {
+        setExtensionPrompt('suspension_preset', '', extension_prompt_types.IN_CHAT, 1);
+    } catch (e) { /* 忽略 */ }
+}
+
 // ---------------- 面板 ----------------
 function buildMenuButton() {
     if ($('#st-suspension-menu-button').length) return;
@@ -264,12 +514,12 @@ function buildPanel() {
           <div class="susp__card" data-feature="preset">
             <div class="susp__card-top">
               <span class="susp__card-title">预设巡查</span>
-              <span class="susp__card-badge">规划中</span>
+              <span class="susp__card-badge on">已上线</span>
             </div>
             <div class="susp__card-desc">绑定预设，每轮检查是否被模型读取并实施，冲突下轮自动注入矫正。</div>
             <div class="susp__card-foot">
               <label class="susp__switch"><input type="checkbox" class="susp__card-toggle" data-feature="preset"><span class="susp__switch-slider"></span></label>
-              <span class="susp__card-foot-label">启用（待实现）</span>
+              <span class="susp__card-foot-label">启用</span>
             </div>
           </div>
           <div class="susp__card" data-feature="style">
@@ -331,11 +581,22 @@ function buildPanel() {
       </div>
 
       <div class="susp__body" data-page="preset" style="display:none">
-        <div class="susp__placeholder">
-          <div class="susp__placeholder-badge">规划中</div>
-          <div class="susp__placeholder-title">预设启用巡查</div>
-          <div class="susp__placeholder-desc">绑定你酒馆里的某个预设，每轮生成后检查预设是否被模型读取并实施；冲突会标注出来，并在下一轮自动注入给模型矫正。依赖「裁判引擎」判定，将在后续版本上线。</div>
+        <div class="susp__pt-toolbar">
+          <label class="susp__switch"><input type="checkbox" class="susp__pt-enabled"><span class="susp__switch-slider"></span></label>
+          <span class="susp__pw-enable-label">启用巡查</span>
+          <span class="susp__spacer"></span>
+          <button type="button" class="susp__btn susp__pt-refresh">刷新预设列表</button>
+          <button type="button" class="susp__btn susp__pt-run">手动巡查一次</button>
         </div>
+        <div class="susp__pt-bind">
+          <div class="susp__field">
+            <label>绑定预设（拉取你酒馆里已保存的聊天补全预设）</label>
+            <select class="susp__pt-preset"><option value="">— 未绑定 —</option></select>
+          </div>
+          <label class="susp__pt-auto"><input type="checkbox" class="susp__pt-autoinject"> 冲突时下一轮自动注入矫正</label>
+          <div class="susp__pt-preview"></div>
+        </div>
+        <div class="susp__pt-list"></div>
       </div>
 
       <div class="susp__body" data-page="style" style="display:none">
@@ -419,6 +680,34 @@ function buildPanel() {
         const e = settings.features.pluginWatch.entries.find(x => x.id === id);
         if (e) clipboardCopy(formatEntryText(e), $(this));
     });
+    // 预设巡查：开关 / 绑定 / 自动注入 / 刷新 / 手动巡查 / 单条复制 / 清空
+    panel.on('change', '.susp__pt-enabled', function () {
+        settings.features.preset.enabled = $(this).prop('checked');
+        saveSettings();
+        renderPreset();
+        renderOverview();
+    });
+    panel.on('change', '.susp__pt-preset', function () {
+        settings.features.preset.presetName = $(this).val() || '';
+        saveSettings();
+        renderPreset();
+    });
+    panel.on('change', '.susp__pt-autoinject', function () {
+        settings.features.preset.autoInject = $(this).prop('checked');
+        saveSettings();
+    });
+    panel.on('click', '.susp__pt-refresh', function () { renderPreset(); });
+    panel.on('click', '.susp__pt-run', function () { inspectPreset(true); });
+    panel.on('click', '.susp__pt-copy', function () {
+        const id = $(this).data('id');
+        const e = settings.features.preset.entries.find(x => x.id === id);
+        if (e) clipboardCopy(formatPresetEntryText(e), $(this));
+    });
+    panel.on('click', '.susp__pt-clear', function () {
+        settings.features.preset.entries = [];
+        saveSettings();
+        renderPreset();
+    });
 }
 
 function togglePanel(show) {
@@ -434,6 +723,7 @@ function renderPanel() {
     if (!panel.length) return;
     renderOverview();
     renderPluginWatch();
+    renderPreset();
 }
 
 function renderOverview() {
@@ -508,6 +798,65 @@ function renderPluginWatch() {
     }
 }
 
+function renderPreset() {
+    const page = $('#st-suspension [data-page="preset"]');
+    if (!page.length) return;
+    const f = settings.features.preset;
+    page.find('.susp__pt-enabled').prop('checked', !!f.enabled);
+    page.find('.susp__pt-autoinject').prop('checked', !!f.autoInject);
+
+    // 预设下拉（拉取酒馆已保存的聊天补全预设）
+    const names = listPresets();
+    const sel = page.find('.susp__pt-preset');
+    const cur = names.includes(f.presetName) ? f.presetName : (f.presetName || '');
+    sel.html('<option value="">— 未绑定 —</option>' + names.map(n => `<option value="${escapeHtml(n)}"${n === cur ? ' selected' : ''}>${escapeHtml(n)}</option>`).join(''));
+    if (f.presetName && !names.includes(f.presetName)) {
+        sel.append(`<option value="${escapeHtml(f.presetName)}" selected>${escapeHtml(f.presetName)}（已失效）</option>`);
+    }
+
+    // 指令预览
+    const preview = page.find('.susp__pt-preview');
+    const preset = cur ? getPresetByName(cur) : null;
+    const inst = preset ? presetInstructionText(preset) : '';
+    if (cur) {
+        if (inst) {
+            preview.html('<div class="susp__pt-preview-label">该预设的指令文本（喂给裁判，最多 ' + PRESET_INSTRUCTION_CHARS + ' 字符）</div><div class="susp__pt-preview-text">' + escapeHtml(inst) + '</div>');
+        } else {
+            preview.html('<div class="susp__pt-warn">该预设里没有可用的指令文本（可能全部是 marker 或空内容），裁判无法判定。</div>');
+        }
+    } else if (!judgeApiConfigured()) {
+        preview.html('<div class="susp__pt-warn">请先在「总览 → 裁判引擎设置」里填好接口地址与模型，预设巡查才可用。</div>');
+    } else {
+        preview.html('');
+    }
+
+    // 冲突记录列表
+    const ul = page.find('.susp__pt-list').empty();
+    if (presetInspecting) ul.append('<div class="susp__pt-loading">判定中…</div>');
+    const entries = f.entries || [];
+    if (!entries.length && !presetInspecting) {
+        ul.append('<div class="susp__pw-empty">暂无冲突。每轮生成后会自动对照预设判定，有冲突会归档到这里。</div>');
+    }
+    for (const e of entries) {
+        const item = $(`
+          <div class="susp__pt-item">
+            <div class="susp__pw-item-top">
+              <span class="susp__pw-time">${escapeHtml(fmtTime(e.ts))}</span>
+              <span class="susp__pw-badge danger">冲突</span>
+              <span class="susp__spacer"></span>
+              <button type="button" class="susp__btn susp__pt-copy" data-id="${e.id}">复制</button>
+            </div>
+            <div class="susp__pt-problem">${escapeHtml(e.problem || '')}</div>
+            ${e.correction ? `<div class="susp__pt-corr"><b>矫正</b> ${escapeHtml(e.correction)}</div>` : ''}
+            ${e.reply ? `<details class="susp__pw-stack"><summary>回复片段</summary><pre>${escapeHtml(e.reply)}</pre></details>` : ''}
+          </div>`);
+        ul.append(item);
+    }
+    if (entries.length) {
+        ul.append('<div class="susp__pt-clear-row"><button type="button" class="susp__btn susp__pt-clear">清空记录</button></div>');
+    }
+}
+
 // ---------------- 初始化 ----------------
 jQuery(async () => {
     loadSettings();
@@ -515,4 +864,11 @@ jQuery(async () => {
     installGlobalHandlers();
     buildMenuButton();
     buildPanel();
+
+    // 每轮生成结束后：先清掉上一轮注入的矫正，再（稍等）对最新 AI 回复做预设巡查
+    eventSource.on(event_types.GENERATION_ENDED, () => {
+        clearCorrectionPrompt();
+        const f = settings.features.preset;
+        if (f.enabled && f.presetName) setTimeout(() => inspectPreset(), 300);
+    });
 });
