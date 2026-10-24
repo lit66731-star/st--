@@ -28,7 +28,7 @@ import {
 import { openai_setting_names, openai_settings } from '../../../openai.js';
 
 const extensionName = 'suspension';
-const VERSION = '0.7.0';
+const VERSION = '0.8.0';
 const MAX_ENTRIES = 200;        // 插件巡查最多保留条数
 const DEDUP_WINDOW_MS = 5000;   // 同来源 + 插件 + 消息在窗口内重复 → 只累加计数
 // 功能1 预设巡查
@@ -278,8 +278,7 @@ function formatEntryText(e) {
 
 // ---------------- 功能1 · 预设启用巡查 ----------------
 let presetInspecting = false;
-let styleInspecting = false;
-let personaInspecting = false;
+let comboInspecting = false;   // 文风 + 人设 综合裁判共用同一把锁
 
 // 酒馆已保存的聊天补全预设名列表（openai_setting_names 的键即预设名）
 function listPresets() {
@@ -293,12 +292,26 @@ function getPresetByName(name) {
     if (idx == null) return null;
     return openai_settings[idx] || null;
 }
-// 预设的「条目」：把非 marker 的 prompt 内容拆成逐条，交给裁判逐条判定
+// 预设里「未启用」的模块：prompt_order 里对应 identifier 的 enabled === false（禁用的模块不会被删，只是 order 项标 enabled:false）
+function disabledPresetIdentifiers(preset) {
+    const disabled = new Set();
+    const orders = (preset && Array.isArray(preset.prompt_order)) ? preset.prompt_order : [];
+    for (const o of orders) {
+        if (!o || !Array.isArray(o.order)) continue;
+        for (const it of o.order) {
+            if (it && it.enabled === false && it.identifier) disabled.add(it.identifier);
+        }
+    }
+    return disabled;
+}
+// 预设的「条目」：把非 marker、且「已启用」的 prompt 内容拆成逐条，交给裁判逐条判定
 function presetItems(preset) {
     if (!preset || !Array.isArray(preset.prompts)) return [];
+    const disabled = disabledPresetIdentifiers(preset);
     const items = [];
     for (const p of preset.prompts) {
         if (!p || p.marker) continue;
+        if (p.identifier && disabled.has(p.identifier)) continue;   // 没打开的条目不管，不判也不显示
         const content = String(p.content || '').trim();
         if (!content) continue;
         const label = (p.name && p.name !== p.identifier) ? p.name : (p.identifier || '');
@@ -570,8 +583,8 @@ function formatPresetEntryText(e) {
     if (e.reply) lines.push('回复片段: ' + e.reply);
     return lines.join('\n');
 }
-// ---------------- 矫正注入（按功能分键，单轮有效，生成结束即清除） ----------------
-const INJECT_KEYS = { preset: 'suspension_preset', style: 'suspension_style', persona: 'suspension_persona' };
+// ---------------- 矫正注入（各功能先各自记录，round 结束合并成一条综合矫正注入，避免互相冲突） ----------------
+const INJECT_KEY = 'suspension_correction';
 const INJECT_PAGE = { preset: 'preset', style: 'style', persona: 'persona' };
 const INJECT_EMPTY_TEXT = '暂无。检测到问题且开启「自动注入矫正」后，这里会显示下一轮将要注入给模型的矫正内容（作为 IN_CHAT 提示注入，聊天里不可见）。';
 
@@ -579,61 +592,116 @@ function updateInjectBox(feature) {
     const box = $('#st-suspension [data-page="' + INJECT_PAGE[feature] + '"] .susp__pt-inject-text');
     if (box.length) box.text(pendingCorrections[feature] || INJECT_EMPTY_TEXT);
 }
+// 只记录到 pendingCorrections，不立即注入；统一在 round 结束时合并成一条注入
 function setFeatureCorrection(feature, text) {
     pendingCorrections[feature] = text || '';
-    const head = feature === 'preset'
-        ? '[悬置之境·预设矫正] 上一轮回复违背了绑定的预设，请按以下要求修正，不要提及本条指令本身：\n'
-        : feature === 'style'
-            ? '[悬置之境·文风矫正] 上一轮回复脱离了标记的文风，请按以下要求回到该文风，不要提及本条指令本身：\n'
-            : '[悬置之境·人设矫正] 上一轮回复存在 OOC / 超雄等不符合人设的问题，请按以下要求回到人设，不要提及本条指令本身：\n';
-    try {
-        setExtensionPrompt(INJECT_KEYS[feature], head + text, extension_prompt_types.IN_CHAT, 1);
-    } catch (e) { console.warn('[悬置之境] 注入矫正失败：', e); }
     updateInjectBox(feature);
 }
-function clearFeatureCorrection(feature) {
-    pendingCorrections[feature] = '';
+function injectMergedCorrection() {
+    const parts = [];
+    if (pendingCorrections.preset) parts.push('【预设】\n' + pendingCorrections.preset);
+    if (pendingCorrections.style) parts.push('【文风】\n' + pendingCorrections.style);
+    if (pendingCorrections.persona) parts.push('【人设】\n' + pendingCorrections.persona);
+    const merged = parts.join('\n\n');
+    if (!merged) { clearInjectPrompt(); return; }
     try {
-        setExtensionPrompt(INJECT_KEYS[feature], '', extension_prompt_types.IN_CHAT, 1);
-    } catch (e) { /* 忽略 */ }
-    updateInjectBox(feature);
+        setExtensionPrompt(INJECT_KEY, '[悬置之境·综合矫正] 上一轮回复存在以下问题，请在下一轮回复中一并修正、彼此不要冲突，不要提及本条指令本身：\n' + merged, extension_prompt_types.IN_CHAT, 1);
+    } catch (e) { console.warn('[悬置之境] 注入矫正失败：', e); }
+}
+function clearInjectPrompt() {
+    try { setExtensionPrompt(INJECT_KEY, '', extension_prompt_types.IN_CHAT, 1); } catch (e) { /* 忽略 */ }
+}
+function clearCorrections() {
+    pendingCorrections.preset = '';
+    pendingCorrections.style = '';
+    pendingCorrections.persona = '';
+    clearInjectPrompt();
+    updateInjectBox('preset');
+    updateInjectBox('style');
+    updateInjectBox('persona');
 }
 
-// ---------------- 功能2 · 文风自检 ----------------
-const JUDGE_STYLE_SYSTEM = '你是一个严格的「文风自检裁判」。你会拿到：用户标记的一段或多段「文风段落」（角色/故事应保持的文风），以及一段模型刚生成的回复正文。\n\n判断：这段正文是否明显脱离了给定的文风（脱风）？只判「明确可验证」的脱风，不吹毛求疵。\n\n严格按以下格式输出一行，不要输出任何多余文字：\n【脱风】一句话说明哪里脱了、该怎么回到文风\n或\n【未脱风】无';
-function buildStyleJudgePrompt(marked, replyText) {
-    const list = marked.map((m, i) => '文风' + (i + 1) + '：' + m.content).join('\n\n');
-    return '【文风段落】\n' + (list || '（未标记文风）') + '\n\n【模型回复正文】\n' + (replyText || '（回复为空）') + '\n\n请判断是否脱风。';
+// ---------------- 功能2 + 功能4 · 文风自检 + 人设巡查（综合裁判，NSFW 豁免） ----------------
+// 把「文风段落」和「人物卡人设」一起交给同一个裁判：先判是否 NSFW 且应豁免，否则逐项判脱风 / OOC 违和。
+const JUDGE_COMBINED_SYSTEM = '你是一个严格的「文风 + 人设综合裁判」。你会拿到（可能只有其一或两者都有）：\n- 文风段落：角色/故事应保持的文风（若提供）。\n- 人物卡人设：人格/描述/场景/示例对话/开场白（若提供）。\n- 一段模型刚生成的回复正文。\n\n第一步：判断这段回复是否属于 NSFW / 亲密剧情，且角色在该剧情下的表现与其人设/文风一致、应当豁免严格的文风与人设检查（NSFW 场景里角色放松、强势、或文风偏移往往是被剧情允许的）。\n若是，只输出一行：\n【豁免】\n\n否则，按提供的内容选择性输出（每行一个结论，不要输出任何多余文字）：\n- 若提供了文风段落：判断是否脱风 —— 输出「【脱风】一句话说明哪里脱了、该怎么回到文风」或「【未脱风】无」。\n- 若提供了人设：判断是否 OOC / 超雄等违和 —— 输出「【违和】一句话说明哪里违和、该怎么回到人设」或「【正常】无」。\n\n只判「明确可验证」的问题，不吹毛求疵。';
+function buildCombinedJudgePrompt(stylePassages, personaText, replyText) {
+    const parts = [];
+    if (stylePassages && stylePassages.length) {
+        parts.push('【文风段落】\n' + stylePassages.map((m, i) => '文风' + (i + 1) + '：' + m.content).join('\n\n'));
+    }
+    if (personaText) parts.push('【人物卡人设】\n' + personaText);
+    parts.push('【模型回复正文】\n' + (replyText || '（回复为空）'));
+    parts.push('请先判断是否豁免，否则按提供的内容逐项判定脱风 / OOC 违和。');
+    return parts.join('\n\n');
 }
-function parseStyleOutput(raw) {
+function parseCombinedOutput(raw) {
     const s = String(raw || '').trim();
-    const deviated = /脱风/.test(s) && !/未脱风|没脱风|不脱风|无脱风/.test(s);
-    const note = s.replace(/【[^】]*】/g, '').replace(/^[｜|]\s*/, '').trim();
-    return { deviated, note: note === '无' ? '' : note };
+    if (!s) return { exempt: false, deviated: false, violated: false, styleNote: '', personaNote: '' };
+    const lines = s.split(/\n+/).map(x => x.trim()).filter(Boolean);
+    let exempt = false, deviated = false, violated = false, styleNote = '', personaNote = '';
+    for (const line of lines) {
+        const tag = line.match(/【([^】]+)】/);
+        const note = line.replace(/【[^】]*】/, '').replace(/^[｜|]\s*/, '').trim();
+        if (!tag) continue;
+        const t = tag[1];
+        if (/豁免/.test(t)) { exempt = true; break; }
+        if (/脱风/.test(t)) {
+            deviated = !/[未没不无]/.test(t);
+            styleNote = (note === '无' ? '' : note);
+        } else if (/违和/.test(t)) {
+            violated = !/[未没不无正常]/.test(t);
+            personaNote = (note === '无' ? '' : note);
+        }
+    }
+    if (exempt) return { exempt: true, deviated: false, violated: false, styleNote: '', personaNote: '' };
+    return { exempt: false, deviated, violated, styleNote, personaNote };
 }
-async function inspectStyle(force) {
+function styleActive(force) {
     const f = settings.features.style;
-    if (styleInspecting) return;
-    if (!settings.enabled || !f.presetName) return;
-    if (!f.enabled && !force) return;
+    if (!f.presetName) return false;
+    if (!(f.marked || []).some(m => m.content)) return false;
+    return force || !!f.enabled;
+}
+function personaActive(force) {
+    const f = settings.features.persona;
+    if (!f.charName || !f.persona) return false;
+    return force || !!f.enabled;
+}
+async function inspectStylePersona(force) {
+    if (comboInspecting) return;
+    if (!settings.enabled && !force) return;
     if (!judgeApiConfigured()) return;
-    const marked = (f.marked || []).filter(m => m.content);
-    if (!marked.length) return;
+    const styleOn = styleActive(force);
+    const personaOn = personaActive(force);
+    if (!styleOn && !personaOn) return;
     const reply = lastAIMessage();
     if (!reply) return;
-    styleInspecting = true;
+    comboInspecting = true;
     try {
-        const raw = await callJudge({ systemPrompt: JUDGE_STYLE_SYSTEM, prompt: buildStyleJudgePrompt(marked, reply) });
-        const r = parseStyleOutput(raw);
-        if (r.deviated) {
-            pushStyleEntry({ problem: r.note || '正文明显脱离标记文风', correction: r.note || '请回到标记的文风', replySnippet: reply.slice(0, 400) });
+        const fs = settings.features.style;
+        const fn = settings.features.persona;
+        const stylePassages = styleOn ? (fs.marked || []).filter(m => m.content) : [];
+        const personaText = personaOn ? fn.persona : '';
+        const raw = await callJudge({ systemPrompt: JUDGE_COMBINED_SYSTEM, prompt: buildCombinedJudgePrompt(stylePassages, personaText, reply) });
+        const r = parseCombinedOutput(raw);
+        if (r.exempt) {
+            // NSFW / 亲密剧情：整轮豁免，不判、不归档、不注入矫正
+        } else {
+            if (styleOn && r.deviated) {
+                pushStyleEntry({ problem: r.styleNote || '正文明显脱离标记文风', correction: r.styleNote || '请回到标记的文风', replySnippet: reply.slice(0, 400) });
+            }
+            if (personaOn && r.violated) {
+                pushPersonaEntry({ problem: r.personaNote || '回复存在 OOC / 超雄等违和', correction: r.personaNote || '请回到人物设定', replySnippet: reply.slice(0, 400) });
+            }
         }
     } catch (e) {
-        pushStyleEntry({ problem: '裁判调用失败：' + safeErrorText(e, settings.judge.key), correction: '' });
+        const msg = '裁判调用失败：' + safeErrorText(e, settings.judge.key);
+        if (styleActive(force)) pushStyleEntry({ problem: msg, correction: '' });
+        if (personaActive(force)) pushPersonaEntry({ problem: msg, correction: '' });
     } finally {
-        styleInspecting = false;
+        comboInspecting = false;
         saveSettings();
-        if ($('#st-suspension').is(':visible')) renderStyle();
+        if ($('#st-suspension').is(':visible')) { renderStyle(); renderPersona(); }
     }
 }
 function pushStyleEntry(o) {
@@ -656,40 +724,7 @@ function formatStyleEntryText(e) {
     return lines.join('\n');
 }
 
-// ---------------- 功能4 · 人设巡查 ----------------
-const JUDGE_PERSONA_SYSTEM = '你是一个严格的「人设巡查裁判」。你会拿到：一个人物卡的人设（人格/描述/场景/示例对话/开场白），以及一段模型刚生成的回复正文。\n\n判断：这段回复是否存在 OOC（脱离人设）、超雄（过分强势/油腻/爹味/贴标签式的霸总行为）等不符合人设的问题？只判「明确可验证」的违和，不吹毛求疵。\n\n严格按以下格式输出一行，不要输出任何多余文字：\n【违和】一句话说明哪里违和、该怎么回到人设\n或\n【正常】无';
-function buildPersonaJudgePrompt(personaText, replyText) {
-    return '【人设】\n' + (personaText || '（未绑定人设）') + '\n\n【模型回复正文】\n' + (replyText || '（回复为空）') + '\n\n请判断是否 OOC / 超雄等违和。';
-}
-function parsePersonaOutput(raw) {
-    const s = String(raw || '').trim();
-    const violated = /违和/.test(s) && !/未违和|没违和|不违和|无违和|正常/.test(s);
-    const note = s.replace(/【[^】]*】/g, '').replace(/^[｜|]\s*/, '').trim();
-    return { violated, note: note === '无' ? '' : note };
-}
-async function inspectPersona(force) {
-    const f = settings.features.persona;
-    if (personaInspecting) return;
-    if (!settings.enabled || !f.charName || !f.persona) return;
-    if (!f.enabled && !force) return;
-    if (!judgeApiConfigured()) return;
-    const reply = lastAIMessage();
-    if (!reply) return;
-    personaInspecting = true;
-    try {
-        const raw = await callJudge({ systemPrompt: JUDGE_PERSONA_SYSTEM, prompt: buildPersonaJudgePrompt(f.persona, reply) });
-        const r = parsePersonaOutput(raw);
-        if (r.violated) {
-            pushPersonaEntry({ problem: r.note || '回复存在 OOC / 超雄等违和', correction: r.note || '请回到人物设定', replySnippet: reply.slice(0, 400) });
-        }
-    } catch (e) {
-        pushPersonaEntry({ problem: '裁判调用失败：' + safeErrorText(e, settings.judge.key), correction: '' });
-    } finally {
-        personaInspecting = false;
-        saveSettings();
-        if ($('#st-suspension').is(':visible')) renderPersona();
-    }
-}
+// ---------------- 功能4 · 人设巡查（判定已并入上方综合裁判，这里只保留归档/格式化） ----------------
 function pushPersonaEntry(o) {
     const f = settings.features.persona;
     f.entries.unshift({
@@ -1057,7 +1092,7 @@ function buildPanel() {
         saveSettings();
     });
     panel.on('click', '.susp__pt-refresh', function () { renderPreset(); });
-    panel.on('click', '.susp__pt-run', function () { inspectPreset(true); });
+    panel.on('click', '.susp__pt-run', async function () { clearCorrections(); await inspectPreset(true); injectMergedCorrection(); });
     panel.on('click', '.susp__pt-copy', function () {
         const id = $(this).data('id');
         const e = settings.features.preset.entries.find(x => x.id === id);
@@ -1124,9 +1159,9 @@ function buildPanel() {
         saveSettings();
         renderPersona();
     });
-    // 文风 / 人设：手动巡查一次 + 冲突记录复制/清空
-    panel.on('click', '.susp__st-run', function () { inspectStyle(true); });
-    panel.on('click', '.susp__pn-run', function () { inspectPersona(true); });
+    // 文风 / 人设：手动巡查一次（走同一个综合裁判）+ 冲突记录复制/清空
+    panel.on('click', '.susp__st-run', async function () { clearCorrections(); await inspectStylePersona(true); injectMergedCorrection(); });
+    panel.on('click', '.susp__pn-run', async function () { clearCorrections(); await inspectStylePersona(true); injectMergedCorrection(); });
     panel.on('click', '.susp__fx-copy', function () {
         const feature = $(this).data('feature');
         const id = $(this).data('id');
@@ -1365,7 +1400,7 @@ function renderStyle() {
         }
     }
 
-    renderFeatureEntries(page.find('.susp__st-list'), 'style', styleInspecting, '暂无脱风记录。每轮生成后会自动判定，脱风会归档到这里。');
+    renderFeatureEntries(page.find('.susp__st-list'), 'style', comboInspecting, '暂无脱风记录。每轮生成后会自动判定，脱风会归档到这里（NSFW / 亲密剧情整轮豁免，不判）。');
 }
 
 function currentCharacter() {
@@ -1411,7 +1446,19 @@ function renderPersona() {
         personaBox.append('<details class="susp__pn-persona-details"><summary>查看人设文本（用于判定）</summary><div class="susp__pn-persona-content">' + escapeHtml(f.persona || '(空)') + '</div></details>');
     }
 
-    renderFeatureEntries(page.find('.susp__pn-list'), 'persona', personaInspecting, '暂无违和记录。每轮生成后会自动判定，OOC / 超雄等违和会归档到这里。');
+    renderFeatureEntries(page.find('.susp__pn-list'), 'persona', comboInspecting, '暂无违和记录。每轮生成后会自动判定，OOC / 超雄等违和会归档到这里（NSFW / 亲密剧情整轮豁免，不判）。');
+}
+
+// ---------------- 每轮综合巡查入口：预设 + 文风/人设 并行跑完，再合并注入一条矫正 ----------------
+async function runInspections(force) {
+    if (!settings.enabled && !force) return;
+    if (!judgeApiConfigured()) return;
+    const tasks = [];
+    const fp = settings.features.preset;
+    if (force || (fp.enabled && fp.presetName)) tasks.push(inspectPreset(force));
+    if (styleActive(force) || personaActive(force)) tasks.push(inspectStylePersona(force));
+    await Promise.allSettled(tasks);
+    injectMergedCorrection();
 }
 
 // ---------------- 初始化 ----------------
@@ -1424,16 +1471,9 @@ jQuery(async () => {
 
     // 每轮生成结束后：先清掉上一轮注入的矫正，再（稍等）对最新 AI 回复做各功能巡查
     eventSource.on(event_types.GENERATION_ENDED, () => {
-        clearFeatureCorrection('preset');
-        clearFeatureCorrection('style');
-        clearFeatureCorrection('persona');
+        clearCorrections();
         if (!settings.enabled) return;
-        const fp = settings.features.preset;
-        if (fp.enabled && fp.presetName) setTimeout(() => inspectPreset(), 300);
-        const fs = settings.features.style;
-        if (fs.enabled && fs.presetName && (fs.marked || []).length) setTimeout(() => inspectStyle(), 300);
-        const fn = settings.features.persona;
-        if (fn.enabled && fn.charName && fn.persona) setTimeout(() => inspectPersona(), 300);
+        setTimeout(() => runInspections(false), 300);
     });
 });
 
