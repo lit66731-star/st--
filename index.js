@@ -16,6 +16,8 @@
 import { extension_settings, extensionNames, extensionTypes, getExtensionManifest } from '../../../extensions.js';
 import {
     chat,
+    characters,
+    this_chid,
     getRequestHeaders,
     eventSource,
     event_types,
@@ -26,7 +28,7 @@ import {
 import { openai_setting_names, openai_settings } from '../../../openai.js';
 
 const extensionName = 'suspension';
-const VERSION = '0.5.0';
+const VERSION = '0.6.0';
 const MAX_ENTRIES = 200;        // 插件巡查最多保留条数
 const DEDUP_WINDOW_MS = 5000;   // 同来源 + 插件 + 消息在窗口内重复 → 只累加计数
 // 功能1 预设巡查
@@ -52,7 +54,7 @@ function freshSettings() {
             preset: { enabled: false, presetName: '', autoInject: true, entries: [], items: [] },  // 功能1 预设启用巡查
             style: { enabled: false, presetName: '', autoInject: true, marked: [], entries: [] },  // 功能2 文风注入自检
             pluginWatch: { enabled: true, entries: [] },  // 功能3 插件巡查（已实现）
-            persona: { enabled: false },            // 功能4 人设巡查（待实现）
+            persona: { enabled: false, autoInject: true, charId: -1, charName: '', persona: '', entries: [] },  // 功能4 人设巡查
         },
     };
 }
@@ -84,6 +86,13 @@ function loadSettings() {
             if (typeof s.features[k].presetName !== 'string') s.features[k].presetName = '';
             if (typeof s.features[k].autoInject !== 'boolean') s.features[k].autoInject = true;
             if (!Array.isArray(s.features[k].marked)) s.features[k].marked = [];
+            if (!Array.isArray(s.features[k].entries)) s.features[k].entries = [];
+        }
+        if (k === 'persona') {
+            if (typeof s.features[k].charName !== 'string') s.features[k].charName = '';
+            if (typeof s.features[k].persona !== 'string') s.features[k].persona = '';
+            if (typeof s.features[k].autoInject !== 'boolean') s.features[k].autoInject = true;
+            if (typeof s.features[k].charId !== 'number') s.features[k].charId = -1;
             if (!Array.isArray(s.features[k].entries)) s.features[k].entries = [];
         }
     }
@@ -652,12 +661,12 @@ function buildPanel() {
           <div class="susp__card" data-feature="persona">
             <div class="susp__card-top">
               <span class="susp__card-title">人设巡查</span>
-              <span class="susp__card-badge">规划中</span>
+              <span class="susp__card-badge wip">进行中</span>
             </div>
             <div class="susp__card-desc">绑定当前人物卡，每轮检查是否 OOC / 超雄等，冲突归档并下轮静默注入矫正。</div>
             <div class="susp__card-foot">
               <label class="susp__switch"><input type="checkbox" class="susp__card-toggle" data-feature="persona"><span class="susp__switch-slider"></span></label>
-              <span class="susp__card-foot-label">启用（待实现）</span>
+              <span class="susp__card-foot-label">启用</span>
             </div>
           </div>
         </div>
@@ -764,11 +773,21 @@ function buildPanel() {
       </div>
 
       <div class="susp__body" data-page="persona" style="display:none">
-        <div class="susp__placeholder">
-          <div class="susp__placeholder-badge">规划中</div>
-          <div class="susp__placeholder-title">人设巡查</div>
-          <div class="susp__placeholder-desc">绑定当前页面的人物设定，每轮角色扮演时静默检查是否 OOC、超雄等一切不符合人设的行为；冲突注入面板（不弹窗），并静默在下一轮注入给模型矫正。将在后续版本上线。</div>
+        <div class="susp__pt-toolbar">
+          <label class="susp__switch"><input type="checkbox" class="susp__pn-enabled"><span class="susp__switch-slider"></span></label>
+          <span class="susp__pw-enable-label">启用巡查</span>
+          <span class="susp__spacer"></span>
+          <button type="button" class="susp__btn susp__pn-bind">绑定当前人物卡</button>
         </div>
+        <div class="susp__pt-bind">
+          <div class="susp__pn-char">
+            <div class="susp__pn-char-name"></div>
+            <div class="susp__pn-char-hint"></div>
+          </div>
+          <label class="susp__pt-auto"><input type="checkbox" class="susp__pn-autoinject"> 违和时下一轮自动注入矫正</label>
+          <div class="susp__pn-persona"></div>
+        </div>
+        <div class="susp__pn-list"></div>
       </div>
     </div>`;
     $('body').append(html);
@@ -913,6 +932,30 @@ function buildPanel() {
         saveSettings();
         renderStyle();
     });
+    // 人设巡查：开关 / 绑定当前人物卡 / 自动注入
+    panel.on('change', '.susp__pn-enabled', function () {
+        settings.features.persona.enabled = $(this).prop('checked');
+        saveSettings();
+        renderPersona();
+        renderOverview();
+    });
+    panel.on('change', '.susp__pn-autoinject', function () {
+        settings.features.persona.autoInject = $(this).prop('checked');
+        saveSettings();
+    });
+    panel.on('click', '.susp__pn-bind', function () {
+        const c = currentCharacter();
+        if (!c) {
+            if (typeof toastr !== 'undefined') toastr.warning('当前没有载入人物卡，无法绑定。');
+            return;
+        }
+        const f = settings.features.persona;
+        f.charId = (typeof this_chid !== 'undefined') ? Number(this_chid) : -1;
+        f.charName = c.name || '';
+        f.persona = buildPersonaText(c);
+        saveSettings();
+        renderPersona();
+    });
 }
 
 function togglePanel(show) {
@@ -930,6 +973,7 @@ function renderPanel() {
     renderPluginWatch();
     renderPreset();
     renderStyle();
+    renderPersona();
     renderExtensionRoster();
 }
 
@@ -1137,6 +1181,49 @@ function renderStyle() {
     }
 }
 
+function currentCharacter() {
+    if (typeof this_chid === 'undefined' || !Array.isArray(characters)) return null;
+    const c = characters[this_chid];
+    return c && typeof c === 'object' ? c : null;
+}
+function buildPersonaText(c) {
+    const parts = [];
+    const push = (label, v) => { const s = String(v || '').trim(); if (s) parts.push('【' + label + '】\n' + s); };
+    push('人格', c.personality);
+    push('描述', c.description);
+    push('场景', c.scenario);
+    push('示例对话', c.mes_example);
+    push('开场白', c.first_mes);
+    return parts.join('\n\n');
+}
+function renderPersona() {
+    const page = $('#st-suspension [data-page="persona"]');
+    if (!page.length) return;
+    const f = settings.features.persona;
+    page.find('.susp__pn-enabled').prop('checked', !!f.enabled);
+    page.find('.susp__pn-autoinject').prop('checked', !!f.autoInject);
+
+    const cur = currentCharacter();
+    const nameBox = page.find('.susp__pn-char-name');
+    const hintBox = page.find('.susp__pn-char-hint');
+    const personaBox = page.find('.susp__pn-persona').empty();
+
+    if (!f.charName) {
+        nameBox.text('未绑定人物卡');
+        hintBox.removeClass('warn').text(cur ? '点击右上角「绑定当前人物卡」把当前角色「' + cur.name + '」绑进来。' : '当前没有载入人物卡。');
+    } else {
+        nameBox.text('已绑定：' + f.charName);
+        if (cur && cur.name && cur.name !== f.charName) {
+            hintBox.addClass('warn').text('当前已切换到「' + cur.name + '」，与绑定的「' + f.charName + '」不一致，可重新绑定。');
+        } else if (cur) {
+            hintBox.removeClass('warn').text('与当前人物卡一致。');
+        } else {
+            hintBox.removeClass('warn').text('当前没有载入人物卡。');
+        }
+        personaBox.append('<details class="susp__pn-persona-details"><summary>查看人设文本（用于判定）</summary><div class="susp__pn-persona-content">' + escapeHtml(f.persona || '(空)') + '</div></details>');
+    }
+}
+
 // ---------------- 初始化 ----------------
 jQuery(async () => {
     loadSettings();
@@ -1152,3 +1239,8 @@ jQuery(async () => {
         if (f.enabled && f.presetName) setTimeout(() => inspectPreset(), 300);
     });
 });
+
+// ST 更新钩子：更新完成后自动刷新整页（manifest 的 hooks.update 指向此导出函数）
+export function reloadOnUpdate() {
+    location.reload();
+}
