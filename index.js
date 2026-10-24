@@ -13,7 +13,7 @@
 //
 // 功能 1/2/4 的「巡查判定」统一走独立可配裁判 endpoint（settings.judge）。
 
-import { extension_settings } from '../../../extensions.js';
+import { extension_settings, extensionNames, extensionTypes, getExtensionManifest } from '../../../extensions.js';
 import {
     chat,
     getRequestHeaders,
@@ -26,13 +26,14 @@ import {
 import { openai_setting_names, openai_settings } from '../../../openai.js';
 
 const extensionName = 'suspension';
-const VERSION = '0.2.0';
+const VERSION = '0.3.0';
 const MAX_ENTRIES = 200;        // 插件巡查最多保留条数
 const DEDUP_WINDOW_MS = 5000;   // 同来源 + 插件 + 消息在窗口内重复 → 只累加计数
 // 功能1 预设巡查
-const MAX_PRESET_ENTRIES = 100;          // 冲突记录最多保留条数
-const PRESET_INSTRUCTION_CHARS = 3000;   // 喂给裁判的预设指令上限（字符）
-const JUDGE_TIMEOUT_MS = 90000;          // 裁判调用超时
+const MAX_PRESET_ENTRIES = 100;   // 冲突记录最多保留条数
+const PRESET_ITEM_CHARS = 600;    // 每个预设条目喂给裁判的内容上限（字符）
+const PRESET_MAX_ITEMS = 12;      // 最多把多少个预设条目喂给裁判
+const JUDGE_TIMEOUT_MS = 90000;   // 裁判调用超时
 
 // 捕获来源 → 面板展示名
 const SRC_LABELS = {
@@ -49,7 +50,7 @@ function freshSettings() {
         enabled: true,                              // 总开关
         judge: { url: '', key: '', model: '' },     // 独立裁判 endpoint（功能 1/2/4 共用）
         features: {
-            preset: { enabled: false, presetName: '', autoInject: true, entries: [] },  // 功能1 预设启用巡查
+            preset: { enabled: false, presetName: '', autoInject: true, entries: [], items: [] },  // 功能1 预设启用巡查
             style: { enabled: false },              // 功能2 文风注入自检（待实现）
             pluginWatch: { enabled: true, entries: [] },  // 功能3 插件巡查（已实现）
             persona: { enabled: false },            // 功能4 人设巡查（待实现）
@@ -77,6 +78,7 @@ function loadSettings() {
             if (typeof s.features[k].presetName !== 'string') s.features[k].presetName = '';
             if (typeof s.features[k].autoInject !== 'boolean') s.features[k].autoInject = true;
             if (!Array.isArray(s.features[k].entries)) s.features[k].entries = [];
+            if (!Array.isArray(s.features[k].items)) s.features[k].items = [];
         }
     }
     settings = s;
@@ -144,6 +146,39 @@ function resolvePlugin(stack) {
         if (/script\.js|\/scripts\//i.test(stack)) return '酒馆核心';
     }
     return '未知';
+}
+
+// ---------------- 功能3 · 插件清单（运行中 / 未运行） ----------------
+// ST 扩展注册表：extensionNames（已安装内部键）、extensionTypes（键→类型）、
+// 启用状态看 extension_settings.disabledExtensions（列入 = 已禁用 = 未运行）。
+function shortExtensionName(name) {
+    return String(name || '').replace(/^(third-party|local|global)\//, '');
+}
+function extensionTypeLabel(type, name) {
+    if (type === 'third-party' || String(name).startsWith('third-party/')) return '第三方';
+    if (type === 'local') return '本地';
+    if (type === 'global') return '全局';
+    return '内置';
+}
+function listExtensions() {
+    const names = Array.isArray(extensionNames) ? extensionNames : [];
+    const disabled = Array.isArray(extension_settings.disabledExtensions) ? extension_settings.disabledExtensions : [];
+    return names.map(name => {
+        const short = shortExtensionName(name);
+        let manifest = null;
+        try { manifest = getExtensionManifest(short); } catch (e) { /* 忽略 */ }
+        const type = (extensionTypes && extensionTypes[name]) || '';
+        return {
+            key: name,
+            name: short,
+            type: type,
+            typeLabel: extensionTypeLabel(type, name),
+            displayName: (manifest && manifest.display_name) || short,
+            author: (manifest && manifest.author) || '',
+            version: (manifest && manifest.version) || '',
+            enabled: !disabled.includes(name),
+        };
+    });
 }
 
 function pushEntry(source, plugin, message, stack) {
@@ -241,18 +276,19 @@ function getPresetByName(name) {
     if (idx == null) return null;
     return openai_settings[idx] || null;
 }
-// 预设的「指令文本」：把非 marker 的 prompt 内容拼起来喂给裁判
-function presetInstructionText(preset) {
-    if (!preset || !Array.isArray(preset.prompts)) return '';
-    const parts = [];
+// 预设的「条目」：把非 marker 的 prompt 内容拆成逐条，交给裁判逐条判定
+function presetItems(preset) {
+    if (!preset || !Array.isArray(preset.prompts)) return [];
+    const items = [];
     for (const p of preset.prompts) {
         if (!p || p.marker) continue;
         const content = String(p.content || '').trim();
         if (!content) continue;
-        const label = (p.name && p.name !== p.identifier) ? (p.name + '：') : '';
-        parts.push(label + content);
+        const label = (p.name && p.name !== p.identifier) ? p.name : (p.identifier || '');
+        items.push({ name: label || ('条目' + (items.length + 1)), content });
+        if (items.length >= PRESET_MAX_ITEMS) break;
     }
-    return parts.join('\n\n').slice(0, PRESET_INSTRUCTION_CHARS);
+    return items;
 }
 
 // ---------------- 裁判引擎（独立 endpoint，转发写法沿用 st-amor） ----------------
@@ -378,24 +414,26 @@ function lastAIMessage() {
     }
     return '';
 }
-function cleanText(s) {
-    return String(s || '').replace(/\r/g, '').trim();
-}
+const JUDGE_SYSTEM = '你是一个严格的「酒馆预设合规裁判」。你会拿到：预设里的多个条目（每个条目有编号、名称、内容），以及一段模型刚生成的回复。\n\n对每个条目，判断模型回复对该条目要求的落实情况，三选一：\n- 遵循：回复明显落实 / 遵守了该条目的要求（绿灯）\n- 冲突：回复明确违背了该条目的要求（红灯）\n- 未使用：该条目与这轮回复无关，既谈不上遵循也谈不上违背（白灯）\n\n只判「明确可验证」的要求，不吹毛求疵。严格按以下格式输出，每个条目一行，不要输出任何多余文字：\n【条目1】遵循/冲突/未使用 ｜ 简短说明（冲突时说明违背了哪条，遵循或未使用时填「无」）\n【条目2】… 依次类推，直到【条目N】';
 
-const JUDGE_SYSTEM = '你是一个严格的「酒馆预设合规裁判」。你会拿到：(1) 一段预设指令，(2) 一段模型刚生成的回复。你的唯一任务：判断这段回复是否违背了预设里明确、可验证的要求（例如人设、格式、输出规则、禁止事项、文风硬性约束等）。只抓「明确违背」，不抓主观喜好、不吹毛求疵、不要求回复里逐条复述预设。\n\n严格按以下格式输出，不要输出任何多余文字：\n【合规】是 或 否\n【问题】若合规填「无」，否则用一句话说清违背了哪条\n【矫正】若合规填「无」，否则用一句话写清下一轮该怎么改';
-
-function buildJudgePrompt(presetText, replyText) {
-    return '【预设指令】\n' + (presetText || '（预设里没有可用指令文本）') + '\n\n【模型回复】\n' + (replyText || '（回复为空）') + '\n\n请判定。';
+function buildJudgePrompt(items, replyText) {
+    const list = items.map((it, i) => '条目' + (i + 1) + '（' + it.name + '）：' + it.content.slice(0, PRESET_ITEM_CHARS)).join('\n\n');
+    return '【预设条目】\n' + (list || '（预设里没有可用条目）') + '\n\n【模型回复】\n' + (replyText || '（回复为空）') + '\n\n请逐条判定。';
 }
-function parseJudgeOutput(raw) {
-    const pick = (label) => {
-        const re = new RegExp('【' + label + '】\\s*([\\s\\S]*?)(?=【[^】]*】|$)', 'i');
+function parseItemJudgeOutput(raw, count) {
+    const items = [];
+    for (let i = 1; i <= count; i++) {
+        const re = new RegExp('【条目' + i + '】\\s*([\\s\\S]*?)(?=【条目' + (i + 1) + '】|$)', 'i');
         const m = String(raw || '').match(re);
-        return m ? m[1].trim() : '';
-    };
-    const ok = pick('合规');
-    const compliant = /否/.test(ok) ? false : (/是/.test(ok) ? true : null);
-    return { compliant, problem: pick('问题'), correction: pick('矫正') };
+        const line = m ? m[1].trim() : '';
+        const first = line.split(/[｜|]/)[0].replace(/\s+/g, '');
+        let status = 'white';
+        if (/冲突|违背|违反|不符|没有遵循|未遵循|没遵循/.test(first)) status = 'red';
+        else if (/遵循|遵守|落实|符合/.test(first) && !/未|不|没|无/.test(first)) status = 'green';
+        const note = line.split(/[｜|]/).slice(1).join('｜').trim();
+        items.push({ status, note: note || '' });
+    }
+    return items;
 }
 
 async function inspectPreset(force) {
@@ -407,18 +445,26 @@ async function inspectPreset(force) {
     const reply = lastAIMessage();
     if (!reply) return;
     const preset = getPresetByName(f.presetName);
-    const instruction = presetInstructionText(preset);
+    const items = presetItems(preset);
+    if (!items.length) return;
     presetInspecting = true;
     try {
-        const raw = await callJudge({ systemPrompt: JUDGE_SYSTEM, prompt: buildJudgePrompt(instruction, reply) });
-        const r = parseJudgeOutput(raw);
-        if (r.compliant === false) {
-            pushPresetEntry({ problem: r.problem || '（裁判未给出具体问题）', correction: r.correction, replySnippet: reply.slice(0, 400) });
+        const raw = await callJudge({ systemPrompt: JUDGE_SYSTEM, prompt: buildJudgePrompt(items, reply) });
+        const results = parseItemJudgeOutput(raw, items.length);
+        const snapshot = items.map((it, i) => ({ name: it.name, status: results[i].status, note: results[i].note }));
+        f.items = snapshot;
+        const reds = snapshot.filter(x => x.status === 'red');
+        if (reds.length) {
+            const problem = reds.map(x => '· ' + x.name + '：' + (x.note && x.note !== '无' ? x.note : '未说明违背点')).join('\n');
+            const correction = reds.map(x => x.name + '：' + (x.note && x.note !== '无' ? x.note : '请遵循该条目')).join('\n');
+            pushPresetEntry({ problem, correction, replySnippet: reply.slice(0, 400) });
         }
     } catch (e) {
+        f.items = [];
         pushPresetEntry({ problem: '裁判调用失败：' + safeErrorText(e, settings.judge.key), correction: '' });
     } finally {
         presetInspecting = false;
+        saveSettings();
         if ($('#st-suspension').is(':visible')) renderPreset();
     }
 }
@@ -572,6 +618,23 @@ function buildPanel() {
           <button type="button" class="susp__btn susp__pw-copyall">复制全部</button>
           <button type="button" class="susp__btn susp__pw-clear">清空</button>
         </div>
+        <div class="susp__pw-roster">
+          <div class="susp__pw-roster-head">
+            <span class="susp__pw-roster-title">插件清单</span>
+            <span class="susp__spacer"></span>
+            <button type="button" class="susp__btn susp__pw-roster-refresh">刷新插件列表</button>
+          </div>
+          <div class="susp__pw-roster-cols">
+            <div class="susp__pw-roster-col">
+              <div class="susp__pw-roster-colhead on">运行中 <b class="susp__pw-run-count">0</b></div>
+              <div class="susp__pw-roster-list susp__pw-running"></div>
+            </div>
+            <div class="susp__pw-roster-col">
+              <div class="susp__pw-roster-colhead off">未运行 <b class="susp__pw-off-count">0</b></div>
+              <div class="susp__pw-roster-list susp__pw-notrunning"></div>
+            </div>
+          </div>
+        </div>
         <div class="susp__pw-filters">
           <div class="susp__pw-srcs"></div>
           <select class="susp__pw-plugin"><option value="">全部插件</option></select>
@@ -594,7 +657,12 @@ function buildPanel() {
             <select class="susp__pt-preset"><option value="">— 未绑定 —</option></select>
           </div>
           <label class="susp__pt-auto"><input type="checkbox" class="susp__pt-autoinject"> 冲突时下一轮自动注入矫正</label>
-          <div class="susp__pt-preview"></div>
+          <div class="susp__pt-legend">
+            <span><span class="susp__pt-dot green"></span>遵循 / 已读取</span>
+            <span><span class="susp__pt-dot red"></span>冲突 / 没遵循</span>
+            <span><span class="susp__pt-dot white"></span>本轮未使用</span>
+          </div>
+          <div class="susp__pt-items"></div>
         </div>
         <div class="susp__pt-list"></div>
       </div>
@@ -680,6 +748,7 @@ function buildPanel() {
         const e = settings.features.pluginWatch.entries.find(x => x.id === id);
         if (e) clipboardCopy(formatEntryText(e), $(this));
     });
+    panel.on('click', '.susp__pw-roster-refresh', function () { renderExtensionRoster(); });
     // 预设巡查：开关 / 绑定 / 自动注入 / 刷新 / 手动巡查 / 单条复制 / 清空
     panel.on('change', '.susp__pt-enabled', function () {
         settings.features.preset.enabled = $(this).prop('checked');
@@ -724,6 +793,7 @@ function renderPanel() {
     renderOverview();
     renderPluginWatch();
     renderPreset();
+    renderExtensionRoster();
 }
 
 function renderOverview() {
@@ -749,6 +819,25 @@ function filteredEntries() {
         if (pwFilter.q && String(e.message).toLowerCase().indexOf(pwFilter.q) < 0) return false;
         return true;
     });
+}
+
+function renderExtensionRoster() {
+    const box = $('#st-suspension .susp__pw-roster');
+    if (!box.length) return;
+    const all = listExtensions();
+    const running = all.filter(x => x.enabled);
+    const off = all.filter(x => !x.enabled);
+    box.find('.susp__pw-run-count').text(running.length);
+    box.find('.susp__pw-off-count').text(off.length);
+    const row = (x) => {
+        const meta = [];
+        if (x.name !== x.displayName) meta.push(x.name);
+        if (x.typeLabel) meta.push(x.typeLabel);
+        if (x.version) meta.push('v' + x.version);
+        return `<div class="susp__pw-roster-item"><span class="susp__pw-roster-name">${escapeHtml(x.displayName)}</span><span class="susp__pw-roster-meta">${escapeHtml(meta.join(' · '))}</span></div>`;
+    };
+    box.find('.susp__pw-running').html(running.map(row).join('') || '<div class="susp__pw-roster-empty">无</div>');
+    box.find('.susp__pw-notrunning').html(off.map(row).join('') || '<div class="susp__pw-roster-empty">无</div>');
 }
 
 function renderPluginWatch() {
@@ -814,28 +903,39 @@ function renderPreset() {
         sel.append(`<option value="${escapeHtml(f.presetName)}" selected>${escapeHtml(f.presetName)}（已失效）</option>`);
     }
 
-    // 指令预览
-    const preview = page.find('.susp__pt-preview');
+    // 条目清单：每条亮灯（绿=遵循/已读取，红=冲突/没遵循，白=本轮未使用）
+    const itemsBox = page.find('.susp__pt-items').empty();
     const preset = cur ? getPresetByName(cur) : null;
-    const inst = preset ? presetInstructionText(preset) : '';
-    if (cur) {
-        if (inst) {
-            preview.html('<div class="susp__pt-preview-label">该预设的指令文本（喂给裁判，最多 ' + PRESET_INSTRUCTION_CHARS + ' 字符）</div><div class="susp__pt-preview-text">' + escapeHtml(inst) + '</div>');
-        } else {
-            preview.html('<div class="susp__pt-warn">该预设里没有可用的指令文本（可能全部是 marker 或空内容），裁判无法判定。</div>');
-        }
-    } else if (!judgeApiConfigured()) {
-        preview.html('<div class="susp__pt-warn">请先在「总览 → 裁判引擎设置」里填好接口地址与模型，预设巡查才可用。</div>');
+    const items = preset ? presetItems(preset) : [];
+    if (!cur) {
+        itemsBox.append('<div class="susp__pt-warn">' + (judgeApiConfigured() ? '请先绑定一个预设，绑定后这里会列出预设里的每个条目。' : '请先在「总览 → 裁判引擎设置」里填好接口地址与模型，预设巡查才可用。') + '</div>');
+    } else if (!items.length) {
+        itemsBox.append('<div class="susp__pt-warn">该预设里没有可用的指令条目（可能全部是 marker 或空内容），无法逐条判定。</div>');
     } else {
-        preview.html('');
+        const last = f.items || [];
+        const statusLabel = { green: '遵循', red: '冲突', white: '未使用' };
+        for (const it of items) {
+            const r = last.find(x => x.name === it.name);
+            const status = r ? r.status : 'white';
+            const note = (r && r.note && r.note !== '无') ? r.note : '';
+            itemsBox.append(`
+              <div class="susp__pt-itemlight">
+                <span class="susp__pt-dot ${status}"></span>
+                <div class="susp__pt-itemlight-body">
+                  <div class="susp__pt-itemlight-name">${escapeHtml(it.name)} <span class="susp__pt-itemlight-status ${status}">${statusLabel[status] || '未使用'}</span></div>
+                  <div class="susp__pt-itemlight-content">${escapeHtml(it.content.slice(0, 400))}${it.content.length > 400 ? '…' : ''}</div>
+                  ${note ? `<div class="susp__pt-itemlight-note">${escapeHtml(note)}</div>` : ''}
+                </div>
+              </div>`);
+        }
     }
 
-    // 冲突记录列表
+    // 冲突历史记录
     const ul = page.find('.susp__pt-list').empty();
     if (presetInspecting) ul.append('<div class="susp__pt-loading">判定中…</div>');
     const entries = f.entries || [];
     if (!entries.length && !presetInspecting) {
-        ul.append('<div class="susp__pw-empty">暂无冲突。每轮生成后会自动对照预设判定，有冲突会归档到这里。</div>');
+        ul.append('<div class="susp__pw-empty">暂无冲突记录。每轮生成后会自动逐条判定，冲突会归档到这里。</div>');
     }
     for (const e of entries) {
         const item = $(`

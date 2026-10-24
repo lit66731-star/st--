@@ -299,18 +299,56 @@
     margin: 4px 0 12px;
 }
 #st-suspension .susp__pt-auto input { accent-color: var(--susp-accent); }
-#st-suspension .susp__pt-preview-label { font-size: 12px; color: var(--susp-text-soft); margin-bottom: 6px; }
-#st-suspension .susp__pt-preview-text {
-    font-size: 12.5px;
-    line-height: 1.6;
+#st-suspension .susp__pt-legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 14px;
+    font-size: 12px;
     color: var(--susp-text-soft);
-    max-height: 200px;
-    overflow-y: auto;
-    padding: 10px 12px;
-    background: rgba(0, 0, 0, 0.35);
+    margin: 4px 0 12px;
+}
+#st-suspension .susp__pt-legend > span { display: inline-flex; align-items: center; gap: 6px; }
+#st-suspension .susp__pt-dot {
+    flex: 0 0 auto;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    display: inline-block;
+    background: #c6ccd6;
+    box-shadow: 0 0 0 3px rgba(198, 204, 214, 0.15);
+}
+#st-suspension .susp__pt-dot.green { background: #57d9a3; box-shadow: 0 0 8px rgba(87, 217, 163, 0.6); }
+#st-suspension .susp__pt-dot.red { background: var(--susp-danger); box-shadow: 0 0 8px rgba(255, 122, 122, 0.6); }
+#st-suspension .susp__pt-items { display: flex; flex-direction: column; gap: 8px; }
+#st-suspension .susp__pt-itemlight {
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+    padding: 12px 14px;
+    background: rgba(0, 0, 0, 0.2);
     border: 1px solid var(--susp-border);
-    border-radius: 9px;
-    white-space: pre-wrap;
+    border-radius: 12px;
+}
+#st-suspension .susp__pt-itemlight .susp__pt-dot { margin-top: 4px; }
+#st-suspension .susp__pt-itemlight-body { flex: 1 1 auto; min-width: 0; }
+#st-suspension .susp__pt-itemlight-name { font-size: 13.5px; font-weight: 600; color: var(--susp-text); margin-bottom: 4px; }
+#st-suspension .susp__pt-itemlight-status {
+    font-size: 11px;
+    font-weight: 500;
+    padding: 1px 8px;
+    border-radius: 999px;
+    margin-left: 6px;
+    vertical-align: 1px;
+}
+#st-suspension .susp__pt-itemlight-status.green { color: #57d9a3; background: rgba(87, 217, 163, 0.14); }
+#st-suspension .susp__pt-itemlight-status.red { color: var(--susp-danger); background: rgba(255, 122, 122, 0.15); }
+#st-suspension .susp__pt-itemlight-status.white { color: var(--susp-text-soft); background: var(--susp-surface-2); }
+#st-suspension .susp__pt-itemlight-content { font-size: 12.5px; line-height: 1.55; color: var(--susp-text-soft); word-break: break-word; }
+#st-suspension .susp__pt-itemlight-note {
+    margin-top: 6px;
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--susp-warn);
     word-break: break-word;
 }
 #st-suspension .susp__pt-warn { font-size: 12.5px; color: var(--susp-warn); line-height: 1.55; }
@@ -322,7 +360,7 @@
     border-radius: 12px;
     padding: 12px 14px;
 }
-#st-suspension .susp__pt-problem { font-size: 13px; line-height: 1.55; color: var(--susp-text); word-break: break-word; }
+#st-suspension .susp__pt-problem { font-size: 13px; line-height: 1.55; color: var(--susp-text); word-break: break-word; white-space: pre-line; }
 #st-suspension .susp__pt-corr {
     margin-top: 8px;
     padding: 8px 12px;
@@ -336,6 +374,34 @@
 }
 #st-suspension .susp__pt-corr b { font-weight: 600; }
 #st-suspension .susp__pt-clear-row { display: flex; justify-content: flex-end; padding-top: 4px; }
+
+/* 插件清单 */
+#st-suspension .susp__pw-roster {
+    margin-bottom: 14px;
+    background: var(--susp-surface);
+    border: 1px solid var(--susp-border);
+    border-radius: 14px;
+    padding: 12px 16px 14px;
+}
+#st-suspension .susp__pw-roster-head { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+#st-suspension .susp__pw-roster-title { font-size: 13px; font-weight: 600; color: var(--susp-text); }
+#st-suspension .susp__pw-roster-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+#st-suspension .susp__pw-roster-colhead { font-size: 12px; color: var(--susp-text-soft); margin-bottom: 6px; }
+#st-suspension .susp__pw-roster-colhead b { font-weight: 600; margin-left: 2px; }
+#st-suspension .susp__pw-roster-colhead.on b { color: #57d9a3; }
+#st-suspension .susp__pw-roster-list { display: flex; flex-direction: column; gap: 6px; }
+#st-suspension .susp__pw-roster-item {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 7px 10px;
+    background: rgba(0, 0, 0, 0.2);
+    border: 1px solid var(--susp-border);
+    border-radius: 9px;
+}
+#st-suspension .susp__pw-roster-name { font-size: 12.5px; color: var(--susp-text); font-weight: 600; word-break: break-word; }
+#st-suspension .susp__pw-roster-meta { font-size: 11px; color: var(--susp-text-soft); word-break: break-word; }
+#st-suspension .susp__pw-roster-empty { font-size: 12px; color: var(--susp-text-soft); padding: 4px 2px; }
 
 /* 占位页 */
 #st-suspension .susp__placeholder {
